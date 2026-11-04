@@ -11,7 +11,7 @@
 制作確認から段階を切り替え、怪談・結末・共有カードを確認する。
 
 2. Apps Scriptの検証プロジェクト
-apps-script/Core.gs、Runtime.gs、AI.gsを新しいプロジェクトへ入れる。
+apps-script/Core.gs、Runtime.gs、AI.gs、Deployment.gsを新しいプロジェクトへ入れる。
 既存のCode.gs/sheetInit.gsは同じプロジェクトに混在させない。
 appsscript.jsonにAsia/TokyoとV8を指定する。
 Script Propertiesへ次を設定する。値をコードやGitに貼らない。
@@ -26,7 +26,19 @@ Script Propertiesへ次を設定する。値をコードやGitに貼らない。
 
 previewMigration()：ヘッダーの確認のみ。データは書き換えない。
 installMillieV10()：空の検証用ブックでusersがない場合に37項目のシートを作成する。既存usersはヘッダーの検証のみ。
+再送の重複排除用に専用タブmillie_event_dedupeを作成する。既存users/queue/logsの列・値は初期化しない。
+このタブにはイベントのハッシュキー・処理時刻・状態だけを記録し、名前や会話内容は保存しない。
+完了履歴は24時間有効。期限切れ行は受信時に最大毎時清掃する。検証中もdedupeタブの手動削除・改名はしない。
 不足・重複ヘッダーがあれば停止する。既存列の並び替え・削除・clear・旧migrateToV9実行はしない。
+
+Webアプリとしてデプロイするときは「次のユーザーとして実行：自分」「アクセスできるユーザー：全員」を指定する。
+Googleへのログインを要求する設定ではWorkerから呼び出せない。認証なしの別セッションでも /exec がログイン画面へ移動しないことを確認する。
+外部からの処理はMILLIE_GATEWAY_SECRETが一致した場合だけ受け付ける。Google Workspaceの組織設定で「全員」が選べない場合は、この構成のまま本番切替しない。
+
+preflightMillieV10()：GASエディタから実行する接続確認。必要設定、シートのヘッダー、LINE bot情報の基本ID一致、Geminiのモデル情報を確認する。
+LINEへのメッセージ送信やusersの書換えはしない。秘密値やAPIエラー本文は出力しない。
+専用タブのヘッダーはinstallMillieV10()で検査されるため、先にinstallerを実行して正常終了を確認する。
+ready=trueでも実際の会話・返信トークン・モデルの回答品質は別途テストする。
 
 3. 署名検証用の入口
 LINEの署名はHTTPヘッダーにあるがApps ScriptのdoPostイベントではそのヘッダーを取得できないため、gateway/worker.mjsを使う。
@@ -51,9 +63,15 @@ Gemini有効化時は相談への自然な応答と物語を先取りしない�
 5. 本番切替
 検証通過後、元のスプレッドシート全体と現行スクリプト・デプロイ版・トリガー設定をバックアップする。
 検証済みプロジェクトとGatewayに本番の設定を入れ、対象ブックを確認する。
+LINE Developersでは基本ID @575kepfk の公式アカウントに接続するMessaging APIチャネルであることを確認する。
+現行Webhook URL、有効・再送の状態、GASのデプロイID・版、旧トリガーの関数名・実行間隔を切戻し記録へ残す。
+署名なしのWorker呼出しが拒否され、正しい署名の空イベントが成功することを確認する。この確認ではLINEへメッセージを送らない。
+空イベントの検証はWorkerで完了するため、GAS・シート・返信APIの疎通確認にはならない。これらは別途確認する。
 LINEのWebhookだけを新Gatewayへ切り替える。元のURLはロールバック用に記録する。
-旧プロジェクトの自動配信が残るかを確認し、意図しない二重配信を防ぐ。
-切替後テストし、問題があればWebhookを旧URLへ戻す。スプレッドシートの初期化で戻そうとしない。
+旧プロジェクトのprocessQueue等のキュー処理と自動配信トリガーは切替後も動くため、実際の設定と未処理queueを確認し、切替時の扱いを記録して停止する。
+Webhookの切替だけでは旧トリガーも既存queueも停止・移行しない。新プロジェクトへ旧トリガーをコピーしない。
+切替後はテストアカウントで会話・停止・再開を確認する。問題があればWebhookを旧URLへ戻し、記録した旧トリガーを復元する。
+Webhookを戻しても新版が更新したusersの値は戻らない。必要なデータ復旧はバックアップと変更対象を確認して個別に行い、スプレッドシートの初期化で戻そうとしない。
 
 テストコマンド（Node.js 22以上、rebuildフォルダで実行）
 node verify.cjs
@@ -63,6 +81,7 @@ node apps-script/core.test.cjs
 node tests/runtime.test.cjs
 node tests/integration.test.cjs
 node apps-script/ai.test.cjs
+node tests/deployment.test.cjs
 node gateway/worker.test.mjs
 
 ブラウザテストは別途PlaywrightとChromiumを用意し、node tests/ui-smoke.cjs。
@@ -72,3 +91,5 @@ node gateway/worker.test.mjs
 本番コードの全量取得ができていないため、現在の全機能を自動で置き換える移行ツールは付けていない。
 自動配信・記念日通知・実紹介の計測は今回未接続。
 LINE/Geminiの実通信、Cloudflare/GASの実デプロイ、実機の共有はこのパッケージ生成時には行っていない。
+完了履歴2000件で停止する制限は専用タブへの保存で解消したが、未送信のprepared/pendingは1件8KB、Properties全体400KiB、件数2000件まで。
+GASのProperties・UrlFetchの日次クォータ、6分の実行時間、5秒のロック待ち、Sheetsの総セル数制限は残る。大量の同時アクセスを無制限に処理できる構成ではない。

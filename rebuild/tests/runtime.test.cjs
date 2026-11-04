@@ -10,6 +10,8 @@ const crypto = require('node:crypto');
 const SOURCE = fs.readFileSync(path.join(__dirname, '../apps-script/Runtime.gs'), 'utf8');
 const HEADERS = 'user_id,name,location,hobby,fears,sleep_time,live_alone,secrets,phase,message_count,invite_count,started_at,last_reply_at,ending_type,is_active,history,workplace,commute,pet,invite_explained,reaction_type,weird_response,invite_response,night_owl,pos_score,neg_score,blunt_score,topics,no_reply_count,last_broadcast_at,referred_by,source,awaiting_source,last_fortune_date,anniversaries_sent,kaidan_told,invite_requested'.split(',');
 const EVENT_PREFIX = 'MILLIE_EVENT_';
+const COMPLETION_SHEET = 'millie_event_dedupe';
+const COMPLETION_HEADERS = ['event_key', 'created_at', 'status'];
 
 function harness(options = {}) {
   const props = {
@@ -18,18 +20,58 @@ function harness(options = {}) {
   };
   const state = {
     sheets: {}, writes: 0, opens: 0, sends: [], coreCalls: 0, aiCalls: 0,
-    failures: [], locked: false, failWriteOnce: false, failPendingOnce: false
+    failures: [], locked: false, failWriteOnce: false, failPendingOnce: false,
+    failCompletionWriteOnce: false, failDeleteOnce: false
   };
   class Sheet {
-    constructor(rows = []) { this.rows = rows.map(row => row.slice()); }
+    constructor(rows = []) {
+      this.rows = rows.map(row => row.slice());
+      this.maxRows = Math.max(1000, rows.length);
+      this.maxColumns = Math.max(26, ...rows.map(row => row.length));
+    }
     getLastColumn() { return Math.max(0, ...this.rows.map(row => row.length)); }
     getLastRow() { return this.rows.length; }
+    getMaxRows() { return this.maxRows; }
+    getMaxColumns() { return this.maxColumns; }
+    insertRowsAfter(after, count) {
+      assert.equal(after, this.maxRows, 'adapter only appends blank grid rows');
+      assert.ok(count > 0);
+      this.maxRows += count;
+      state.writes += 1;
+    }
+    insertColumnsAfter(after, count) {
+      assert.equal(after, this.maxColumns);
+      assert.ok(count > 0);
+      this.maxColumns += count;
+      state.writes += 1;
+    }
     getRange(row, column, height = 1, width = 1) {
+      assert.ok(row > 0 && column > 0 && height > 0 && width > 0);
+      if (row + height - 1 > this.maxRows || column + width - 1 > this.maxColumns) throw new Error('range exceeds grid limits');
       return {
         getValues: () => Array.from({ length: height }, (_, dy) =>
           Array.from({ length: width }, (_, dx) => this.rows[row - 1 + dy]?.[column - 1 + dx] ?? '')),
+        createTextFinder: text => {
+          let entire = false;
+          return {
+            matchEntireCell(value) { entire = value; return this; },
+            findAll: () => {
+              const found = [];
+              for (let dy = 0; dy < height; dy += 1) {
+                for (let dx = 0; dx < width; dx += 1) {
+                  const value = String(this.rows[row - 1 + dy]?.[column - 1 + dx] ?? '');
+                  if (entire ? value === text : value.includes(text)) found.push({ getRow: () => row + dy });
+                }
+              }
+              return found;
+            }
+          };
+        },
         setValues: values => {
           if (state.failWriteOnce) { state.failWriteOnce = false; throw new Error('simulated sheet failure'); }
+          if (state.failCompletionWriteOnce && this === state.sheets[COMPLETION_SHEET] && row > 1) {
+            state.failCompletionWriteOnce = false; throw new Error('simulated completion sheet failure');
+          }
           assert.equal(values.length, height);
           values.forEach((valuesRow, dy) => {
             assert.equal(valuesRow.length, width);
@@ -40,8 +82,10 @@ function harness(options = {}) {
         }
       };
     }
+    deleteRows(row, count) { this.rows.splice(row - 1, count); this.maxRows -= count; state.writes += 1; }
   }
   if (options.sheet !== false) state.sheets.users = new Sheet(options.rows || [HEADERS]);
+  if (options.completions !== false) state.sheets[COMPLETION_SHEET] = new Sheet(options.completionRows || [COMPLETION_HEADERS]);
   const book = {
     getSheetByName: name => state.sheets[name] || null,
     insertSheet: name => { assert.equal(state.sheets[name], undefined); return (state.sheets[name] = new Sheet()); }
@@ -56,7 +100,10 @@ function harness(options = {}) {
       }
       props[name] = String(value); return properties;
     },
-    deleteProperty: name => { delete props[name]; return properties; }
+    deleteProperty: name => {
+      if (state.failDeleteOnce && name.startsWith(EVENT_PREFIX)) { state.failDeleteOnce = false; throw new Error('simulated property deletion failure'); }
+      delete props[name]; return properties;
+    }
   };
   const core = options.core || {
     newUser: (id, now) => ({ user_id: id, message_count: 0, phase: 0, is_active: true, history: '[]', started_at: now }),
@@ -129,7 +176,11 @@ function harness(options = {}) {
       if (!row) return null;
       return Object.fromEntries(headers.map((header, index) => [header, row[index] ?? '']));
     },
-    records() { return Object.entries(props).filter(([key]) => key.startsWith(EVENT_PREFIX)).map(([key, value]) => ({ key, ...JSON.parse(value) })); }
+    records() {
+      const pending = Object.entries(props).filter(([key]) => key.startsWith(EVENT_PREFIX)).map(([key, value]) => ({ key, ...JSON.parse(value) }));
+      const done = (state.sheets[COMPLETION_SHEET]?.rows.slice(1) || []).map(([key, created, status]) => ({ key, v: 1, created, status }));
+      return pending.concat(done);
+    }
   };
 }
 
@@ -307,8 +358,8 @@ test('record size and aggregate capacity fail before changing user state', () =>
 test('prunes event dedupe after the documented 24 hour window', () => {
   const h = harness();
   assert.equal(h.receive([event()]).ok, true);
-  const record = h.records()[0];
-  h.props[record.key] = JSON.stringify({ v: 1, created: Date.now() - 25 * 3600000, status: 'done' });
+  h.state.sheets[COMPLETION_SHEET].rows[1][1] = Date.now() - 25 * 3600000;
+  h.props.MILLIE_DEDUPE_PRUNED_AT = '0';
   assert.equal(h.receive([event()]).ok, true);
   assert.equal(h.user().message_count, 2);
   assert.equal(h.state.coreCalls, 2);
@@ -384,6 +435,131 @@ test('share cards select only Core-owned public copy by allowlisted topic ID', (
   assert.ok(flex.includes('固定の公開文'));
   assert.ok(!flex.includes('private title'));
   assert.ok(!flex.includes('private history'));
+});
+
+test('more than 2,000 successful events keep working and every completion still deduplicates', () => {
+  const h = harness();
+  for (let i = 0; i < 2105; i += 1) {
+    const result = h.receive([event('viral-' + i, 'hello')]);
+    assert.equal(result.ok, true, `event ${i}: ${JSON.stringify(result)}`);
+  }
+  assert.equal(h.user().message_count, 2105);
+  assert.equal(h.state.sheets[COMPLETION_SHEET].rows.length, 2106);
+  assert.ok(h.state.sheets[COMPLETION_SHEET].getMaxRows() >= 2106);
+  assert.equal(Object.keys(h.props).filter(key => key.startsWith(EVENT_PREFIX)).length, 0);
+  const sends = h.state.sends.length;
+  for (const index of [0, 1999, 2000, 2104]) assert.equal(h.receive([event('viral-' + index, 'hello')]).ok, true);
+  assert.equal(h.user().message_count, 2105);
+  assert.equal(h.state.coreCalls, 2105);
+  assert.equal(h.state.sends.length, sends);
+  for (const row of h.state.sheets[COMPLETION_SHEET].rows.slice(1)) {
+    assert.equal(row.length, 3);
+    assert.ok(/^MILLIE_EVENT_[a-f0-9]{64}$/.test(row[0]));
+    assert.ok(!JSON.stringify(row).includes('U-test-user'));
+    assert.ok(!JSON.stringify(row).includes('hello'));
+  }
+});
+
+test('migrates an already-full legacy done store before accepting the next event', () => {
+  const legacy = {};
+  const now = Date.now();
+  for (let i = 0; i < 2000; i += 1) {
+    const key = EVENT_PREFIX + crypto.createHash('sha256').update('legacy-' + i).digest('hex');
+    legacy[key] = JSON.stringify({ v: 1, created: now, status: i % 2 ? 'abandoned' : 'done' });
+  }
+  const h = harness({ properties: legacy });
+  assert.equal(h.receive([event('new-after-legacy')]).ok, true);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.state.sheets[COMPLETION_SHEET].rows.length, 2002);
+  assert.ok(h.state.sheets[COMPLETION_SHEET].getMaxRows() >= 2002);
+  assert.equal(Object.keys(h.props).filter(key => key.startsWith(EVENT_PREFIX)).length, 0);
+  assert.equal(h.receive([event('legacy-0')]).ok, true);
+  assert.equal(h.receive([event('legacy-1999')]).ok, true);
+  assert.equal(h.state.coreCalls, 1);
+  assert.equal(h.state.sends.length, 1);
+});
+
+test('sheet completion survives failure to delete the pending property and suppresses its retry', () => {
+  const h = harness();
+  h.state.failDeleteOnce = true;
+  assert.equal(h.receive([event()]).ok, false);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.state.sends.length, 1);
+  assert.equal(h.state.sheets[COMPLETION_SHEET].rows.length, 2);
+  assert.equal(Object.keys(h.props).filter(key => key.startsWith(EVENT_PREFIX)).length, 1);
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.state.coreCalls, 1);
+  assert.equal(h.state.sends.length, 1);
+  assert.equal(Object.keys(h.props).filter(key => key.startsWith(EVENT_PREFIX)).length, 0);
+});
+
+test('legacy migration keeps original dedupe records until its sheet write succeeds', () => {
+  const key = EVENT_PREFIX + crypto.createHash('sha256').update('legacy-protected').digest('hex');
+  const h = harness({ properties: { [key]: JSON.stringify({ v: 1, created: Date.now(), status: 'done' }) } });
+  h.state.failCompletionWriteOnce = true;
+  assert.equal(h.receive([event('next')]).ok, false);
+  assert.ok(h.props[key]);
+  assert.equal(h.state.coreCalls, 0);
+  assert.equal(h.user(), null);
+  assert.equal(h.receive([event('next')]).ok, true);
+  assert.equal(h.props[key], undefined);
+  assert.equal(h.receive([event('legacy-protected')]).ok, true);
+  assert.equal(h.state.coreCalls, 1);
+});
+
+test('pending outbox ceiling remains bounded and fails before mutating user state', () => {
+  const properties = {};
+  for (let i = 0; i < 2000; i += 1) properties[EVENT_PREFIX + 'other-pending-' + i] = JSON.stringify({
+    v: 1, created: Date.now(), status: 'pending', userHash: 'other', messages: []
+  });
+  const h = harness({ properties });
+  assert.equal(h.receive([event('no-outbox-space')]).error, 'outbox_capacity_reached');
+  assert.equal(h.user(), null);
+  assert.equal(h.state.sends.length, 0);
+});
+
+test('expired completion cleanup preserves active metadata and every existing users column', () => {
+  const now = Date.now();
+  const old = now - 25 * 3600000;
+  const h = harness({ completionRows: [
+    COMPLETION_HEADERS,
+    ['old-a', old, 'done'], ['keep-a', now, 'done'],
+    ['old-b', old, 'done'], ['old-c', old, 'abandoned'], ['keep-b', now, 'abandoned']
+  ] });
+  assert.equal(h.receive([event()]).ok, true);
+  const keys = h.state.sheets[COMPLETION_SHEET].rows.slice(1).map(row => row[0]);
+  assert.ok(keys.includes('keep-a'));
+  assert.ok(keys.includes('keep-b'));
+  assert.ok(!keys.some(key => key.startsWith('old-')));
+  assert.deepEqual(h.state.sheets.users.rows[0], HEADERS);
+});
+
+test('installer creates the separate metadata sheet; mismatched metadata headers fail closed', () => {
+  const missing = harness({ completions: false });
+  const result = missing.sandbox.installMillieV10();
+  assert.ok(result.changes.includes('created_event_dedupe_sheet'));
+  assert.deepEqual(missing.state.sheets[COMPLETION_SHEET].rows[0], COMPLETION_HEADERS);
+  const malformed = harness({ completionRows: [['existing_unrelated_header'], ['do not overwrite']] });
+  assert.equal(malformed.receive([event()]).error, 'schema_invalid_event_dedupe');
+  assert.equal(malformed.state.coreCalls, 0);
+  assert.equal(malformed.state.sheets[COMPLETION_SHEET].rows[1][0], 'do not overwrite');
+  assert.equal(malformed.state.writes, 0);
+});
+
+test('new user past the 1,000-row grid expands rows and preserves existing rows and extra columns', () => {
+  const headers = [...HEADERS, 'operator_note'];
+  const rows = [headers];
+  for (let i = 0; i < 999; i += 1) rows.push(headers.map(name => ({
+    user_id: 'U-existing-' + i, name: '既存' + i, message_count: 4, operator_note: '=existing-formula-' + i
+  })[name] ?? ''));
+  const h = harness({ rows });
+  assert.equal(h.state.sheets.users.getMaxRows(), 1000);
+  assert.equal(h.receive([event('new-user-beyond-grid')]).ok, true);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.state.sheets.users.getLastRow(), 1001);
+  assert.ok(h.state.sheets.users.getMaxRows() >= 1001);
+  assert.equal(h.state.sheets.users.getMaxColumns(), headers.length);
+  assert.deepEqual(h.state.sheets.users.rows.slice(0, 1000), rows);
 });
 
 module.exports = { harness, event, HEADERS };

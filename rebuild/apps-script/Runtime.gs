@@ -20,9 +20,13 @@ var MillieRuntime = (function () {
   var NUMBER_FIELDS = ['phase', 'message_count', 'invite_count', 'pos_score', 'neg_score', 'blunt_score', 'no_reply_count'];
   var EVENT_PREFIX = 'MILLIE_EVENT_';
   var EVENT_TTL_MS = 24 * 60 * 60 * 1000;
+  var COMPLETION_SHEET = 'millie_event_dedupe';
+  var COMPLETION_HEADERS = ['event_key', 'created_at', 'status'];
+  var COMPLETION_PRUNED_AT = 'MILLIE_DEDUPE_PRUNED_AT';
+  var COMPLETION_PRUNE_MS = 60 * 60 * 1000;
   var MAX_RECORD_BYTES = 8000;
   var MAX_PROPERTY_BYTES = 400 * 1024;
-  var MAX_EVENT_RECORDS = 2000;
+  var MAX_PENDING_RECORDS = 2000;
   var MAX_BODY_BYTES = 1024 * 1024;
   var MAX_BATCH_EVENTS = 100;
   var DEFAULT_ADD_URL = 'https://line.me/R/ti/p/@575kepfk';
@@ -164,10 +168,16 @@ var MillieRuntime = (function () {
     return patch;
   }
 
+  function ensureRows(sheet, lastNeededRow) {
+    var maxRows = sheet.getMaxRows();
+    if (lastNeededRow > maxRows) sheet.insertRowsAfter(maxRows, Math.max(500, lastNeededRow - maxRows));
+  }
+
   function applyPatch(store, found, patch, userId) {
     var row = found.row || Math.max(2, store.sheet.getLastRow() + 1);
     if (!found.row && patch.user_id !== userId) throw fault('invalid_new_user_patch');
     if (patch.user_id && patch.user_id !== userId) throw fault('invalid_user_patch');
+    ensureRows(store.sheet, row);
     var writes = Object.keys(patch).map(function (name) {
       if (HEADERS.indexOf(name) < 0) throw fault('invalid_patch_field');
       return { column: store.schema.map[name] + 1, value: cell(patch[name]) };
@@ -198,6 +208,97 @@ var MillieRuntime = (function () {
     });
   }
 
+  function completionStore(book) {
+    var sheet = book.getSheetByName(COMPLETION_SHEET);
+    var created = false;
+    if (!sheet) {
+      sheet = book.insertSheet(COMPLETION_SHEET);
+      sheet.getRange(1, 1, 1, COMPLETION_HEADERS.length).setValues([COMPLETION_HEADERS.slice()]);
+      SpreadsheetApp.flush();
+      created = true;
+    }
+    var headers = sheet.getLastColumn() ? sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0] : [];
+    if (JSON.stringify(headers) !== JSON.stringify(COMPLETION_HEADERS)) throw fault('schema_invalid_event_dedupe');
+    return { sheet: sheet, created: created };
+  }
+
+  function completed(completions, key, now) {
+    var lastRow = completions.sheet.getLastRow();
+    if (lastRow < 2) return null;
+    // Sheets searches the key column; successful event volume does not consume
+    // ScriptProperties capacity or require loading all completed records.
+    var matches = completions.sheet.getRange(2, 1, lastRow - 1, 1)
+      .createTextFinder(key).matchEntireCell(true).findAll();
+    for (var i = 0; i < matches.length; i += 1) {
+      var values = completions.sheet.getRange(matches[i].getRow(), 1, 1, 3).getValues()[0];
+      var created = Number(values[1]);
+      if (isFinite(created) && now - created < EVENT_TTL_MS && (values[2] === 'done' || values[2] === 'abandoned')) {
+        return { v: 1, created: created, status: values[2] };
+      }
+    }
+    return null;
+  }
+
+  function pruneCompleted(completions, properties, now) {
+    var lastPruned = Number(properties.getProperty(COMPLETION_PRUNED_AT));
+    if (lastPruned && now - lastPruned < COMPLETION_PRUNE_MS) return;
+    var sheet = completions.sheet;
+    var lastRow = sheet.getLastRow();
+    if (lastRow > 1) {
+      var values = sheet.getRange(2, 2, lastRow - 1, 1).getValues();
+      var runs = [];
+      var start = 0;
+      values.forEach(function (row, index) {
+        var created = Number(row[0]);
+        var expired = isFinite(created) && now - created >= EVENT_TTL_MS;
+        if (expired && !start) start = index + 2;
+        if (start && (!expired || index === values.length - 1)) {
+          var end = expired ? index + 2 : index + 1;
+          runs.push({ row: start, count: end - start + 1 });
+          start = 0;
+        }
+      });
+      // Delete only expired metadata rows in our own sheet, from bottom upward.
+      runs.reverse().forEach(function (run) { sheet.deleteRows(run.row, run.count); });
+      if (runs.length) SpreadsheetApp.flush();
+    }
+    properties.setProperty(COMPLETION_PRUNED_AT, String(now));
+  }
+
+  function migrateCompleted(completions, properties, now) {
+    var all = properties.getProperties();
+    var legacy = [];
+    Object.keys(all).forEach(function (key) {
+      if (key.indexOf(EVENT_PREFIX) !== 0) return;
+      var record;
+      try { record = JSON.parse(all[key]); } catch (_) { return; }
+      if (record.status !== 'done' && record.status !== 'abandoned') return;
+      if (record.v !== 1 || typeof record.created !== 'number' || !isFinite(record.created)) throw fault('corrupt_outbox_record');
+      legacy.push({ key: key, record: record });
+    });
+    if (!legacy.length) return;
+    // One batch migrates older deployments, including an already-full 2,000
+    // record Properties store. Keep originals until the sheet write is durable.
+    var lastRow = completions.sheet.getLastRow();
+    var known = {};
+    if (lastRow > 1) completions.sheet.getRange(2, 1, lastRow - 1, 3).getValues().forEach(function (row) {
+      if (now - Number(row[1]) < EVENT_TTL_MS) known[row[0]] = true;
+    });
+    var rows = [];
+    legacy.sort(function (a, b) { return a.record.created - b.record.created; }).forEach(function (item) {
+      if (!known[item.key] && now - item.record.created < EVENT_TTL_MS) {
+        rows.push([item.key, item.record.created, item.record.status]);
+        known[item.key] = true;
+      }
+    });
+    if (rows.length) {
+      ensureRows(completions.sheet, lastRow + rows.length);
+      completions.sheet.getRange(lastRow + 1, 1, rows.length, 3).setValues(rows);
+      SpreadsheetApp.flush();
+    }
+    legacy.forEach(function (item) { properties.deleteProperty(item.key); });
+  }
+
   function saveRecord(properties, key, record) {
     var serialized = JSON.stringify(record);
     if (bytes(serialized) > MAX_RECORD_BYTES) throw fault('outbox_record_too_large');
@@ -210,7 +311,7 @@ var MillieRuntime = (function () {
       size += bytes(existingKey) + bytes(all[existingKey]);
       if (existingKey.indexOf(EVENT_PREFIX) === 0) count += 1;
     });
-    if (size > MAX_PROPERTY_BYTES || count >= MAX_EVENT_RECORDS) throw fault('outbox_capacity_reached');
+    if (size > MAX_PROPERTY_BYTES || count >= MAX_PENDING_RECORDS) throw fault('outbox_capacity_reached');
     properties.setProperty(key, serialized);
   }
 
@@ -225,9 +326,17 @@ var MillieRuntime = (function () {
     return record;
   }
 
-  function markDone(properties, key, record, status) {
-    // Keep only dedupe metadata after success: no conversation, profile, or LINE ID.
-    saveRecord(properties, key, { v: 1, created: record.created, status: status || 'done' });
+  function markDone(completions, properties, key, record, status) {
+    // Flush the metadata-only completion before removing the pending outbox.
+    // A crash between these steps is resolved by consulting the sheet first.
+    if (!completed(completions, key, new Date().getTime())) {
+      var row = completions.sheet.getLastRow() + 1;
+      ensureRows(completions.sheet, row);
+      completions.sheet.getRange(row, 1, 1, 3)
+        .setValues([[key, record.created, status || 'done']]);
+      SpreadsheetApp.flush();
+    }
+    properties.deleteProperty(key);
   }
 
   function finishPrepared(store, properties, key, record, userId) {
@@ -256,7 +365,7 @@ var MillieRuntime = (function () {
     prepared.forEach(function (item) { finishPrepared(store, properties, item.key, item.record, userId); });
   }
 
-  function abandonInactiveOutbox(store, properties, userId) {
+  function abandonInactiveOutbox(store, completions, properties, userId) {
     var found = findUser(store, userId);
     if (!found.user || found.user.is_active !== false) return;
     var userHash = hash(userId);
@@ -266,7 +375,7 @@ var MillieRuntime = (function () {
       var record;
       try { record = JSON.parse(all[key]); } catch (_) { return; }
       if (record.userHash === userHash && record.status === 'pending' && record.activeReply === true) {
-        markDone(properties, key, record, 'abandoned');
+        markDone(completions, properties, key, record, 'abandoned');
       }
     });
   }
@@ -380,12 +489,17 @@ var MillieRuntime = (function () {
       typeof event.message.text === 'string' && event.message.text.length > 0 && event.message.text.length <= 5000;
   }
 
-  function handleEvent(store, properties, event, now) {
+  function handleEvent(store, completions, properties, event, now) {
     if (!supported(event)) return { status: 'skipped' };
     if (typeof event.webhookEventId !== 'string' || !event.webhookEventId || event.webhookEventId.length > 256) {
       throw fault('webhook_event_id_required');
     }
     var key = EVENT_PREFIX + hash(event.webhookEventId);
+    if (completed(completions, key, now.getTime())) {
+      // Clean up an outbox left behind after a successful completion write.
+      if (properties.getProperty(key)) properties.deleteProperty(key);
+      return { status: 'duplicate' };
+    }
     var record = loadRecord(properties, key);
     if (record && (record.status === 'done' || record.status === 'abandoned')) return { status: 'duplicate' };
     var userId = event.source.userId;
@@ -393,7 +507,8 @@ var MillieRuntime = (function () {
     // Complete this user's interrupted sheet commit before computing a later
     // event. Otherwise an old prepared patch could roll back newer progress.
     recoverPrepared(store, properties, userId);
-    abandonInactiveOutbox(store, properties, userId);
+    abandonInactiveOutbox(store, completions, properties, userId);
+    if (completed(completions, key, now.getTime())) return { status: 'duplicate' };
     record = loadRecord(properties, key);
     if (record && (record.status === 'done' || record.status === 'abandoned')) return { status: 'duplicate' };
     var found = findUser(store, userId);
@@ -414,12 +529,13 @@ var MillieRuntime = (function () {
     if (record.status === 'prepared') {
       finishPrepared(store, properties, key, record, userId);
     }
-    abandonInactiveOutbox(store, properties, userId);
+    abandonInactiveOutbox(store, completions, properties, userId);
+    if (completed(completions, key, now.getTime())) return { status: 'duplicate' };
     record = loadRecord(properties, key);
     if (record.status === 'abandoned') return { status: 'duplicate' };
     var outcome = reply(properties, event.replyToken, record.messages);
     if (outcome.success) {
-      markDone(properties, key, record);
+      markDone(completions, properties, key, record);
       return { status: 'done' };
     }
     // Retain the fixed outbox on LINE errors. No additional history/count update.
@@ -445,13 +561,17 @@ var MillieRuntime = (function () {
       if (!lock.tryLock(5000)) return json({ ok: false, error: 'busy' });
       var now = new Date();
       prune(properties, now.getTime());
-      var store = requireSchema(openBook(properties));
+      var book = openBook(properties);
+      var store = requireSchema(book);
+      var completions = completionStore(book);
+      pruneCompleted(completions, properties, now.getTime());
+      migrateCompleted(completions, properties, now.getTime());
       var processed = 0;
       var skipped = 0;
       var pending = false;
       var errors = [];
       payload.events.forEach(function (event) {
-        var result = handleEvent(store, properties, event, now);
+        var result = handleEvent(store, completions, properties, event, now);
         if (result.status === 'skipped') skipped += 1;
         else processed += 1;
         if (result.status === 'pending') {
@@ -487,18 +607,25 @@ var MillieRuntime = (function () {
       var sheet = book.getSheetByName('users');
       if (!sheet) {
         sheet = book.insertSheet('users');
+        var maxColumns = sheet.getMaxColumns();
+        if (maxColumns < HEADERS.length) sheet.insertColumnsAfter(maxColumns, HEADERS.length - maxColumns);
         sheet.getRange(1, 1, 1, HEADERS.length).setValues([HEADERS.slice()]);
         SpreadsheetApp.flush();
+        var newCompletions = completionStore(book);
         if (!properties.getProperty('MILLIE_V10_INSTALLED_AT')) properties.setProperty('MILLIE_V10_INSTALLED_AT', new Date().toISOString());
         var created = publicSchema(inspectSchema(sheet), sheet);
         created.changes = ['created_users_sheet_with_37_headers'];
+        if (newCompletions.created) created.changes.push('created_event_dedupe_sheet');
         return created;
       }
       var schema = inspectSchema(sheet);
       if (!schema.ok) throw fault('schema_' + schema.reason);
+      var completions = completionStore(book);
       if (!properties.getProperty('MILLIE_V10_INSTALLED_AT')) properties.setProperty('MILLIE_V10_INSTALLED_AT', new Date().toISOString());
       // Existing headers, users, queue, logs, and triggers are never modified here.
-      return publicSchema(schema, sheet);
+      var result = publicSchema(schema, sheet);
+      if (completions.created) result.changes.push('created_event_dedupe_sheet');
+      return result;
     } finally { lock.releaseLock(); }
   }
 
