@@ -11,6 +11,8 @@ Node.jsの自動検証
   過去の既知メタassistant履歴をAI入力から除き、ユーザーが引用して相談する文章は保持。
 ・旧版向けOutputGuard：7テスト成功。thought:true除外、非thoughtの全text連結、内部説明の全文破棄、ひらがな・絵文字付き窓表現、通常会話・否定・明示的怪談の保持、ログ・通信・状態変更がないこと。
   旧版の全ソースとnull時の呼出し元は未取得のため、現行に適用する前の確認が必要。
+・手動貼り替え用ブロック：構文、9応答ケース、既存外側チェック3ケース、I/O・データ変更なしを検証。
+  OutputGuardをそのまま関数内部へ埋め、検知・空文時は固定台詞を返す。実GASへの貼り付け・反映は未実施。
 ・本番設定の診断：10テスト成功。LINE基本ID一致、モデルの存在とgenerateContent対応、未設定・API失敗時の停止、診断ログへの秘密値非露出。
 ・Gateway：HMAC署名、改ざん、サイズ制限、GAS業務エラー、Cloudflare ExecutionContext引数。
 ・Apps Script 4ファイル、旧版向けOutputGuard、HTML内JavaScriptの構文検証成功。
