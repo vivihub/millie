@@ -81,11 +81,15 @@ node apps-script/core.test.cjs
 node tests/runtime.test.cjs
 node tests/integration.test.cjs
 node apps-script/ai.test.cjs
+node tests/output-guard.test.cjs
 node tests/deployment.test.cjs
 node gateway/worker.test.mjs
 
 ブラウザテストは別途PlaywrightとChromiumを用意し、node tests/ui-smoke.cjs。
 デモHTMLは生成済みなので、ZIPを開くだけならビルドは不要。
+
+現行版の内部説明文の誤送信対策だけを先に行う場合は、hotfix/適用手順.txtを確認する。
+これは現行ソースと呼出し元を照合してから適用する最小パッチ候補であり、パッケージ生成時点では未適用。
 
 制限
 本番コードの全量取得ができていないため、現在の全機能を自動で置き換える移行ツールは付けていない。
