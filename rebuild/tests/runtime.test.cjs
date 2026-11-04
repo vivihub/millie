@@ -1,0 +1,389 @@
+'use strict';
+
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const vm = require('node:vm');
+const crypto = require('node:crypto');
+
+const SOURCE = fs.readFileSync(path.join(__dirname, '../apps-script/Runtime.gs'), 'utf8');
+const HEADERS = 'user_id,name,location,hobby,fears,sleep_time,live_alone,secrets,phase,message_count,invite_count,started_at,last_reply_at,ending_type,is_active,history,workplace,commute,pet,invite_explained,reaction_type,weird_response,invite_response,night_owl,pos_score,neg_score,blunt_score,topics,no_reply_count,last_broadcast_at,referred_by,source,awaiting_source,last_fortune_date,anniversaries_sent,kaidan_told,invite_requested'.split(',');
+const EVENT_PREFIX = 'MILLIE_EVENT_';
+
+function harness(options = {}) {
+  const props = {
+    SPREADSHEET_ID: 'test-sheet', MILLIE_GATEWAY_SECRET: 'test-gateway-secret',
+    CHANNEL_ACCESS_TOKEN: 'test-line-token', ...options.properties
+  };
+  const state = {
+    sheets: {}, writes: 0, opens: 0, sends: [], coreCalls: 0, aiCalls: 0,
+    failures: [], locked: false, failWriteOnce: false, failPendingOnce: false
+  };
+  class Sheet {
+    constructor(rows = []) { this.rows = rows.map(row => row.slice()); }
+    getLastColumn() { return Math.max(0, ...this.rows.map(row => row.length)); }
+    getLastRow() { return this.rows.length; }
+    getRange(row, column, height = 1, width = 1) {
+      return {
+        getValues: () => Array.from({ length: height }, (_, dy) =>
+          Array.from({ length: width }, (_, dx) => this.rows[row - 1 + dy]?.[column - 1 + dx] ?? '')),
+        setValues: values => {
+          if (state.failWriteOnce) { state.failWriteOnce = false; throw new Error('simulated sheet failure'); }
+          assert.equal(values.length, height);
+          values.forEach((valuesRow, dy) => {
+            assert.equal(valuesRow.length, width);
+            if (!this.rows[row - 1 + dy]) this.rows[row - 1 + dy] = [];
+            valuesRow.forEach((value, dx) => { this.rows[row - 1 + dy][column - 1 + dx] = value; });
+          });
+          state.writes += 1;
+        }
+      };
+    }
+  }
+  if (options.sheet !== false) state.sheets.users = new Sheet(options.rows || [HEADERS]);
+  const book = {
+    getSheetByName: name => state.sheets[name] || null,
+    insertSheet: name => { assert.equal(state.sheets[name], undefined); return (state.sheets[name] = new Sheet()); }
+  };
+  const properties = {
+    getProperty: name => Object.prototype.hasOwnProperty.call(props, name) ? props[name] : null,
+    getProperties: () => ({ ...props }),
+    setProperty: (name, value) => {
+      if (state.failPendingOnce && name.startsWith(EVENT_PREFIX) && JSON.parse(value).status === 'pending') {
+        state.failPendingOnce = false;
+        throw new Error('simulated property failure');
+      }
+      props[name] = String(value); return properties;
+    },
+    deleteProperty: name => { delete props[name]; return properties; }
+  };
+  const core = options.core || {
+    newUser: (id, now) => ({ user_id: id, message_count: 0, phase: 0, is_active: true, history: '[]', started_at: now }),
+    respond: (user, text, ctx) => {
+      state.coreCalls += 1;
+      if (text === '停止' || text === '再開') return {
+        user: { ...user, is_active: text === '再開' }, messages: [text + 'しました。'], counted: false
+      };
+      const counted = text !== '__follow__';
+      const after = { ...user, is_active: true, last_reply_at: ctx.now };
+      if (counted) {
+        after.message_count = (Number(user.message_count) || 0) + 1;
+        after.phase = Math.floor(after.message_count / 5);
+        after.history = JSON.stringify([{ role: 'user', content: text }]);
+      }
+      return {
+        user: after, messages: [counted ? `reply:${text}` : 'わたし、ミリー。'], counted,
+        ...(text === '共有' ? { shareCard: { title: 'secret name', lines: ['private text'] } } : {})
+      };
+    }
+  };
+  const sandbox = {
+    Date, JSON, Math, Object, Array, String, Number, Error, isFinite,
+    PropertiesService: { getScriptProperties: () => properties },
+    SpreadsheetApp: {
+      openById: id => { assert.equal(id, 'test-sheet'); state.opens += 1; return book; },
+      flush: () => {}
+    },
+    LockService: {
+      getScriptLock: () => ({
+        tryLock: millis => { assert.equal(millis, 5000); if (options.busy) return false; state.locked = true; return true; },
+        hasLock: () => state.locked,
+        releaseLock: () => { state.locked = false; }
+      })
+    },
+    ContentService: {
+      MimeType: { JSON: 'application/json' },
+      createTextOutput: content => ({ content, setMimeType() { return this; } })
+    },
+    Utilities: {
+      DigestAlgorithm: { SHA_256: 'SHA_256' }, Charset: { UTF_8: 'UTF_8' },
+      computeDigest: (_algorithm, text) => Array.from(crypto.createHash('sha256').update(text).digest()),
+      newBlob: text => ({ getBytes: () => Array.from(Buffer.from(text)) }),
+      formatDate: date => new Date(date.getTime() + 9 * 3600000).toISOString().slice(0, 10)
+    },
+    UrlFetchApp: {
+      fetch: (url, args) => {
+        assert.equal(url, 'https://api.line.me/v2/bot/message/reply');
+        assert.equal(args.headers.Authorization, 'Bearer test-line-token');
+        state.sends.push(JSON.parse(args.payload));
+        const failure = state.failures.shift();
+        if (failure === 'network') throw new Error('network failure');
+        return { getResponseCode: () => failure || 200 };
+      }
+    },
+    MillieCore: core
+  };
+  if (options.ai) sandbox.MillieAI = { enhance: (...args) => { state.aiCalls += 1; return options.ai(...args); } };
+  vm.createContext(sandbox);
+  vm.runInContext(SOURCE, sandbox, { filename: 'Runtime.gs' });
+  return {
+    state, props, sandbox,
+    receive(events, secret = props.MILLIE_GATEWAY_SECRET) {
+      return JSON.parse(sandbox.doPost({ postData: { contents: JSON.stringify({ gatewaySecret: secret, events }) } }).content);
+    },
+    user(id = 'U-test-user') {
+      const sheet = state.sheets.users;
+      const headers = sheet.rows[0];
+      const row = sheet.rows.slice(1).find(values => values[headers.indexOf('user_id')] === id);
+      if (!row) return null;
+      return Object.fromEntries(headers.map((header, index) => [header, row[index] ?? '']));
+    },
+    records() { return Object.entries(props).filter(([key]) => key.startsWith(EVENT_PREFIX)).map(([key, value]) => ({ key, ...JSON.parse(value) })); }
+  };
+}
+
+function event(id = 'event-1', text = 'こんにちは', overrides = {}) {
+  return {
+    webhookEventId: id, replyToken: `reply-token-${id}`, timestamp: Date.now(), type: 'message',
+    source: { type: 'user', userId: 'U-test-user' }, message: { type: 'text', id: `msg-${id}`, text }, ...overrides
+  };
+}
+
+test('rejects direct / unauthenticated requests before accessing user data', () => {
+  const h = harness();
+  assert.deepEqual(h.receive([event()], 'wrong'), { ok: false, error: 'unauthorized' });
+  assert.equal(h.state.opens, 0);
+  assert.equal(h.state.coreCalls, 0);
+  assert.equal(h.state.sends.length, 0);
+  assert.deepEqual(JSON.parse(h.sandbox.doPost({ postData: { contents: '{' } }).content), { ok: false, error: 'invalid_json' });
+  assert.equal(h.receive([]).ok, true);
+  assert.equal(h.state.opens, 0);
+});
+
+test('uses header names and preserves reordered and extra existing columns', () => {
+  const headers = [...HEADERS.slice().reverse(), 'operator_note'];
+  const row = headers.map(name => ({ user_id: 'U-test-user', message_count: 9, phase: 1, is_active: 'TRUE', operator_note: '=untouched-formula' })[name] ?? '');
+  const h = harness({ rows: [headers, row] });
+  const originalHeaders = h.state.sheets.users.rows[0].slice();
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.user().message_count, 10);
+  assert.equal(h.user().operator_note, '=untouched-formula');
+  assert.deepEqual(h.state.sheets.users.rows[0], originalHeaders);
+  assert.equal(h.sandbox.previewMigration().extra[0], 'operator_note');
+});
+
+test('read-only preview and installer never repair or clear existing schema', () => {
+  const headers = HEADERS.filter(name => name !== 'history');
+  const h = harness({ rows: [headers, ['U-existing']] });
+  assert.equal(h.sandbox.previewMigration().ok, false);
+  assert.equal(h.state.writes, 0);
+  assert.throws(() => h.sandbox.installMillieV10(), /schema_missing_headers/);
+  assert.equal(h.state.writes, 0);
+  assert.equal(h.state.sheets.users.rows.length, 2);
+  const fresh = harness({ sheet: false });
+  assert.equal(fresh.sandbox.installMillieV10().ok, true);
+  assert.equal(fresh.state.sheets.users.rows[0].length, 37);
+  const writes = fresh.state.writes;
+  assert.equal(fresh.sandbox.installMillieV10().ok, true);
+  assert.equal(fresh.state.writes, writes);
+  assert.ok(fresh.props.MILLIE_V10_INSTALLED_AT);
+});
+
+test('duplicate completed webhook does not count or reply twice; completed records contain metadata only', () => {
+  const h = harness();
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.receive([event('event-1', 'こんにちは', { replyToken: 'new-token' })]).ok, true);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.state.coreCalls, 1);
+  assert.equal(h.state.sends.length, 1);
+  const record = h.records()[0];
+  assert.equal(record.status, 'done');
+  assert.equal(Object.keys(record).sort().join(','), 'created,key,status,v');
+  assert.ok(!JSON.stringify(record).includes('U-test-user'));
+  assert.ok(!JSON.stringify(record).includes('こんにちは'));
+});
+
+test('failed LINE reply retains a fixed pending outbox; redelivery retries without recounting', () => {
+  const h = harness();
+  h.state.failures.push(500);
+  assert.equal(h.receive([event()]).ok, false);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.records()[0].status, 'pending');
+  assert.equal(h.records()[0].patch, undefined);
+  const result = h.receive([event('event-1', '改ざんされた再送文', { replyToken: 'fresh-token' })]);
+  assert.equal(result.ok, true);
+  assert.equal(h.state.coreCalls, 1);
+  assert.equal(h.user().message_count, 1);
+  assert.deepEqual(h.state.sends[0].messages, h.state.sends[1].messages);
+  assert.equal(h.state.sends[1].replyToken, 'fresh-token');
+  assert.equal(h.records()[0].status, 'done');
+});
+
+test('expired or used reply tokens stay pending and never invoke a push API', () => {
+  const h = harness();
+  h.state.failures.push(400, 400);
+  assert.equal(h.receive([event()]).ok, false);
+  assert.equal(h.receive([event()]).ok, false);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.state.coreCalls, 1);
+  assert.equal(h.records()[0].status, 'pending');
+  assert.equal(h.state.sends.length, 2);
+});
+
+test('prepared journal recovers a failed sheet commit without rerunning Core', () => {
+  const h = harness();
+  h.state.failWriteOnce = true;
+  assert.equal(h.receive([event()]).ok, false);
+  assert.equal(h.user(), null);
+  assert.equal(h.records()[0].status, 'prepared');
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.state.coreCalls, 1);
+  assert.equal(h.state.sends.length, 1);
+});
+
+test('later user events finish an interrupted commit first and old retries do not roll back progress', () => {
+  const h = harness();
+  h.state.failPendingOnce = true;
+  assert.equal(h.receive([event()]).ok, false);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.records()[0].status, 'prepared');
+  assert.equal(h.receive([event('event-2', '続き')]).ok, true);
+  assert.equal(h.user().message_count, 2);
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.user().message_count, 2);
+  assert.equal(h.state.coreCalls, 2);
+});
+
+test('follow greeting is uncounted; refollow keeps progress; unfollow deactivates', () => {
+  const h = harness();
+  assert.equal(h.receive([event('follow-1', '', { type: 'follow' })]).ok, true);
+  assert.equal(h.user().message_count, 0);
+  assert.equal(h.receive([event('message-1')]).ok, true);
+  assert.equal(h.receive([event('unfollow-1', '', { type: 'unfollow', replyToken: undefined })]).ok, true);
+  assert.equal(h.user().is_active, false);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.receive([event('follow-2', '', { type: 'follow' })]).ok, true);
+  assert.equal(h.user().is_active, true);
+  assert.equal(h.user().message_count, 1);
+  assert.equal(h.state.coreCalls, 2);
+  const noUser = harness();
+  assert.equal(noUser.receive([event('unfollow-only', '', { type: 'unfollow' })]).ok, true);
+  assert.equal(noUser.user(), null);
+});
+
+test('ignores groups, rooms and non-text messages', () => {
+  const h = harness();
+  const response = h.receive([
+    event('group', 'hello', { source: { type: 'group', userId: 'U-test-user', groupId: 'G-test' } }),
+    event('image', '', { message: { type: 'image', id: 'image-1' } })
+  ]);
+  assert.equal(response.ok, true);
+  assert.equal(response.skipped, 2);
+  assert.equal(h.user(), null);
+  assert.equal(h.state.coreCalls, 0);
+  assert.equal(h.state.sends.length, 0);
+});
+
+test('shared Flex card contains fixed anonymous public copy and never profile data', () => {
+  const h = harness();
+  assert.equal(h.receive([event('share', '共有')]).ok, true);
+  const flex = h.state.sends[0].messages.find(message => message.type === 'flex');
+  assert.ok(flex);
+  assert.ok(!JSON.stringify(flex).includes('secret name'));
+  assert.ok(!JSON.stringify(flex).includes('private text'));
+  assert.ok(!JSON.stringify(flex).includes('U-test-user'));
+  assert.ok(JSON.stringify(flex).includes('https://line.me/R/ti/p/@575kepfk'));
+});
+
+test('record size and aggregate capacity fail before changing user state', () => {
+  const large = harness({
+    core: {
+      newUser: id => ({ user_id: id, message_count: 0, is_active: true }),
+      respond: user => ({ user: { ...user, message_count: 1 }, messages: Array.from({ length: 4 }, () => crypto.randomBytes(3000).toString('base64')), counted: true })
+    }
+  });
+  const response = large.receive([event('large')]);
+  assert.equal(response.ok, false);
+  assert.equal(response.error, 'outbox_record_too_large');
+  assert.equal(large.user(), null);
+  assert.equal(large.state.sends.length, 0);
+  const full = harness({ properties: { unrelated_existing_property: 'a'.repeat(400 * 1024) } });
+  assert.equal(full.receive([event()]).error, 'outbox_capacity_reached');
+  assert.equal(full.user(), null);
+});
+
+test('prunes event dedupe after the documented 24 hour window', () => {
+  const h = harness();
+  assert.equal(h.receive([event()]).ok, true);
+  const record = h.records()[0];
+  h.props[record.key] = JSON.stringify({ v: 1, created: Date.now() - 25 * 3600000, status: 'done' });
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.user().message_count, 2);
+  assert.equal(h.state.coreCalls, 2);
+});
+
+test('optional AI only runs when Core explicitly marks a response eligible', () => {
+  const h = harness({ ai: () => { throw new Error('must not run'); } });
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.state.aiCalls, 0);
+  const eligible = harness({
+    core: {
+      newUser: id => ({ user_id: id, message_count: 0 }),
+      respond: user => ({ user: { ...user, message_count: 1 }, messages: ['core fallback'], counted: true, aiEligible: true })
+    },
+    ai: () => { throw new Error('AI failure'); }
+  });
+  assert.equal(eligible.receive([event()]).ok, true);
+  assert.equal(eligible.state.aiCalls, 1);
+  assert.equal(eligible.state.sends[0].messages[0].text, 'core fallback');
+});
+
+test('lock contention is bounded and does not mutate state', () => {
+  const h = harness({ busy: true });
+  assert.deepEqual(h.receive([event()]), { ok: false, error: 'busy' });
+  assert.equal(h.state.opens, 0);
+  assert.equal(h.state.coreCalls, 0);
+});
+
+test('stop / unfollow abandons older active outbox replies, including after a resume', () => {
+  for (const stopEvent of [event('stop', '停止'), event('unfollow', '', { type: 'unfollow' })]) {
+    const h = harness();
+    h.state.failures.push(500);
+    assert.equal(h.receive([event('earlier')]).ok, false);
+    assert.equal(h.records()[0].status, 'pending');
+    assert.equal(h.receive([stopEvent]).ok, true);
+    assert.equal(h.user().is_active, false);
+    assert.equal(h.records()[0].status, 'abandoned');
+    assert.equal(h.receive([event('resume', '再開')]).ok, true);
+    assert.equal(h.user().is_active, true);
+    const sends = h.state.sends.length;
+    assert.equal(h.receive([event('earlier')]).ok, true);
+    assert.equal(h.state.sends.length, sends);
+    assert.equal(h.user().message_count, 1);
+  }
+});
+
+test('AI reply and its history persist together while progress remains Core-owned', () => {
+  const history = JSON.stringify([{ role: 'assistant', content: 'AIの返信' }]);
+  const h = harness({
+    core: {
+      newUser: id => ({ user_id: id, message_count: 0, is_active: true }),
+      respond: user => ({ user: { ...user, message_count: 1, history: '[]' }, messages: ['core fallback'], counted: true, aiEligible: true })
+    },
+    ai: (_user, _text, result) => ({ ...result, messages: ['AIの返信'], user: { ...result.user, message_count: 999, history } })
+  });
+  assert.equal(h.receive([event()]).ok, true);
+  assert.equal(h.state.sends[0].messages[0].text, 'AIの返信');
+  assert.equal(h.user().history, history);
+  assert.equal(h.user().message_count, 1);
+});
+
+test('share cards select only Core-owned public copy by allowlisted topic ID', () => {
+  const h = harness({
+    core: {
+      newUser: id => ({ user_id: id, message_count: 0, is_active: true }),
+      respond: user => ({ user, messages: ['カードを置くね。'], counted: false, shareCard: { id: 'hanako', title: 'private title', lines: ['private history'] } }),
+      publicCard: id => ({ title: id + 'の公開カード', lines: ['固定の公開文'] })
+    }
+  });
+  assert.equal(h.receive([event('share-card')]).ok, true);
+  const flex = JSON.stringify(h.state.sends[0].messages[1]);
+  assert.ok(flex.includes('hanakoの公開カード'));
+  assert.ok(flex.includes('固定の公開文'));
+  assert.ok(!flex.includes('private title'));
+  assert.ok(!flex.includes('private history'));
+});
+
+module.exports = { harness, event, HEADERS };

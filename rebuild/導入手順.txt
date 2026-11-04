@@ -1,0 +1,68 @@
+ミリーちゃん v10 検証・導入手順
+
+このパッケージを現在のプロジェクトに追加するだけでは利用できません。
+既存のCode.gs/sheetInit.gsと新しいdoPostなどが衝突するため、新しい検証用Apps Scriptプロジェクトで確認します。
+既存コードのバックアップと、users/queue/logsを含むスプレッドシートのコピーを用意してから行います。
+現行への適用・デプロイはこの作業では実施していません。
+
+1. 手元で試す
+ミリーちゃん_作品準拠サンプル.htmlをブラウザで開く。
+固定分岐デモなので資格情報やネット接続は不要。名前・会話は外部送信や永続保存をしない。
+制作確認から段階を切り替え、怪談・結末・共有カードを確認する。
+
+2. Apps Scriptの検証プロジェクト
+apps-script/Core.gs、Runtime.gs、AI.gsを新しいプロジェクトへ入れる。
+既存のCode.gs/sheetInit.gsは同じプロジェクトに混在させない。
+appsscript.jsonにAsia/TokyoとV8を指定する。
+Script Propertiesへ次を設定する。値をコードやGitに貼らない。
+  SPREADSHEET_ID：検証用スプレッドシートのID
+  CHANNEL_ACCESS_TOKEN：検証用LINE Messaging APIのアクセストークン
+  MILLIE_GATEWAY_SECRET：独自に生成した十分長いランダム値
+  LINE_ADD_URL：任意。未指定はユーザー指定の@575kepfk
+  MILLIE_AI_ENABLED：初期はfalse
+  GEMINI_API_KEY：AIを有効化する場合だけ設定
+  GEMINI_MODEL：利用アカウントで使えるモデルID。コード側で古いモデル名を固定しない。
+  MILLIE_AI_ENABLED=true：実モデルの検証時に有効化する。
+
+previewMigration()：ヘッダーの確認のみ。データは書き換えない。
+installMillieV10()：空の検証用ブックでusersがない場合に37項目のシートを作成する。既存usersはヘッダーの検証のみ。
+不足・重複ヘッダーがあれば停止する。既存列の並び替え・削除・clear・旧migrateToV9実行はしない。
+
+3. 署名検証用の入口
+LINEの署名はHTTPヘッダーにあるがApps ScriptのdoPostイベントではそのヘッダーを取得できないため、gateway/worker.mjsを使う。
+別のCloudflare Workerとして作成する（既存サイトのWorkerは変更しない）。
+Worker Secrets:
+  LINE_CHANNEL_SECRET：検証用LINEチャネルのシークレット
+  MILLIE_GATEWAY_SECRET：Apps Scriptと同じ値
+  GAS_WEB_APP_URL：検証用Apps ScriptをWebアプリとしてデプロイした /exec URL
+WorkerはLINEの未加工本文をHMAC-SHA256検証後にGASへ渡す。署名がない／違う場合は処理しない。
+LINEのWebhook URLはWorkerの https://(作成したドメイン)/webhook とする。
+Script PropertiesとWorker Secretsには本番の値を使う前に検証環境で確認する。
+LINE管理画面の自動応答が二重返信にならないかも確認する。
+一時的な失敗時に再送できるよう、LINE DevelopersでWebhook再送を有効にして検証する。
+Reply Tokenが失効した場合、勝手にpushで補完しないため、その返信は配信できないことがある。
+
+4. 検証項目
+新規follow、通常会話、コマンド、52通の進行、占い同日制限、停止・再開、怪談の解放、共有カード。
+同一webhookEventIdの再送、LINE API失敗後の再送、既存旧結末を持つユーザーの扱い。
+実ユーザー情報を使ったスクリーンショットは共有しない。テストアカウントで実施。
+Gemini有効化時は相談への自然な応答と物語を先取りしないことを確認する。
+
+5. 本番切替
+検証通過後、元のスプレッドシート全体と現行スクリプト・デプロイ版・トリガー設定をバックアップする。
+検証済みプロジェクトとGatewayに本番の設定を入れ、対象ブックを確認する。
+LINEのWebhookだけを新Gatewayへ切り替える。元のURLはロールバック用に記録する。
+旧プロジェクトの自動配信が残るかを確認し、意図しない二重配信を防ぐ。
+切替後テストし、問題があればWebhookを旧URLへ戻す。スプレッドシートの初期化で戻そうとしない。
+
+テストコマンド（Node.js 22以上）
+node apps-script/core.test.cjs
+node tests/runtime.test.cjs
+node tests/integration.test.cjs
+node apps-script/ai.test.cjs
+node gateway/worker.test.mjs
+
+制限
+本番コードの全量取得ができていないため、現在の全機能を自動で置き換える移行ツールは付けていない。
+自動配信・記念日通知・実紹介の計測は今回未接続。
+LINE/Geminiの実通信、Cloudflare/GASの実デプロイ、実機の共有はこのパッケージ生成時には行っていない。
