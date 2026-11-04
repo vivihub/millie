@@ -55,12 +55,18 @@ LINEのWebhookだけを新Gatewayへ切り替える。元のURLはロールバ�
 旧プロジェクトの自動配信が残るかを確認し、意図しない二重配信を防ぐ。
 切替後テストし、問題があればWebhookを旧URLへ戻す。スプレッドシートの初期化で戻そうとしない。
 
-テストコマンド（Node.js 22以上）
+テストコマンド（Node.js 22以上、rebuildフォルダで実行）
+node verify.cjs
+
+個別実行
 node apps-script/core.test.cjs
 node tests/runtime.test.cjs
 node tests/integration.test.cjs
 node apps-script/ai.test.cjs
 node gateway/worker.test.mjs
+
+ブラウザテストは別途PlaywrightとChromiumを用意し、node tests/ui-smoke.cjs。
+デモHTMLは生成済みなので、ZIPを開くだけならビルドは不要。
 
 制限
 本番コードの全量取得ができていないため、現在の全機能を自動で置き換える移行ツールは付けていない。
