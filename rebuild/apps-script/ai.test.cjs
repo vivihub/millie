@@ -85,6 +85,32 @@ test('valid ordinary replies use the configured API header and persist the actua
   assert.equal(h.state.logs.length, 0);
 });
 
+test('Gemini 2.5 Flash variants disable thinking while preserving the v10 response settings', () => {
+  for (const model of ['gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-2.5-flash-preview-test']) {
+    const h = harness({ properties: { GEMINI_MODEL: model } });
+    assert.equal(h.enhance().messages[0], SAFE_REPLY);
+    const request = h.state.requests[0];
+    assert.equal(request.url, 'https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent');
+    assert.deepEqual(JSON.parse(request.args.payload).generationConfig, {
+      temperature: 0.65, maxOutputTokens: 400, responseMimeType: 'application/json',
+      thinkingConfig: { thinkingBudget: 0, includeThoughts: false }
+    });
+    assert.equal(request.args.headers['x-goog-api-key'], 'fake-test-key');
+    assert.equal(h.state.logs.length, 0);
+  }
+});
+
+test('other model families keep the original v10 generation configuration', () => {
+  for (const model of ['test-model', 'gemini-2.0-flash-lite', 'gemini-2.5-pro', 'gemini-2.5-flashish']) {
+    const h = harness({ properties: { GEMINI_MODEL: model } });
+    assert.equal(h.enhance().messages[0], SAFE_REPLY);
+    assert.deepEqual(JSON.parse(h.state.requests[0].args.payload).generationConfig, {
+      temperature: 0.65, maxOutputTokens: 400, responseMimeType: 'application/json'
+    });
+    assert.equal(h.state.logs.length, 0);
+  }
+});
+
 test('disabled AI, story milestones, share responses, and invalid credentials never call the provider', () => {
   for (const options of [
     { properties: { MILLIE_AI_ENABLED: 'false' } },
@@ -212,6 +238,39 @@ test('known meta assistant history is excluded while user quotations and the cur
   const savedHistory = JSON.parse(actual.user.history);
   assert.ok(!savedHistory.some(entry => /^(assistant|model)$/.test(entry.role) && /THOUGHTS:|ANALYSIS:/.test(entry.content)));
   assert.ok(savedHistory.some(entry => entry.role === 'user' && entry.content === quotation));
+  assert.equal(h.state.logs.length, 0);
+});
+
+test('legacy text and mixed-field meta assistant history are excluded while legacy user quotations stay', () => {
+  const h = harness();
+  const quotation = '「THOUGHTS:」という表示について説明して。';
+  const previous = [
+    { role: 'model', text: 'THOUGHTS: Synthetic legacy note.' },
+    { role: 'assistant', text: 'ANALYSIS: Synthetic legacy note.' },
+    { role: 'assistant', content: 'ふつうの文。', text: 'THOUGHTS: Synthetic mixed-field note.' },
+    { role: 'user', text: quotation },
+    { role: 'model', text: 'ふつうの旧形式の返事。' },
+    { role: 'assistant', content: 'ふつうの新形式の返事。' }
+  ];
+  const before = { history: JSON.stringify(previous) };
+  const originalBefore = before.history;
+  const result = fallback();
+  result.user.history = JSON.stringify([
+    ...previous, { role: 'user', content: quotation },
+    { role: 'assistant', content: result.messages[0] }
+  ]);
+  const actual = h.enhance(result, before, quotation);
+  const promptHistory = JSON.parse(h.state.prompts[0].user.history);
+  assert.equal(promptHistory.filter(entry => /^(assistant|model)$/.test(entry.role)).length, 2);
+  assert.ok(promptHistory.some(entry => entry.role === 'user' && entry.text === quotation));
+  assert.equal(h.state.prompts[0].input, quotation);
+  assert.ok(promptHistory.some(entry => entry.role === 'model' && entry.text === 'ふつうの旧形式の返事。'));
+  const savedHistory = JSON.parse(actual.user.history);
+  assert.ok(!savedHistory.some(entry => /^(assistant|model)$/.test(entry.role) &&
+    [entry.content, entry.text].some(text => typeof text === 'string' && /THOUGHTS:|ANALYSIS:/.test(text))));
+  assert.ok(savedHistory.some(entry => entry.role === 'user' && entry.text === quotation));
+  assert.ok(savedHistory.some(entry => entry.role === 'user' && entry.content === quotation));
+  assert.equal(before.history, originalBefore);
   assert.equal(h.state.logs.length, 0);
 });
 

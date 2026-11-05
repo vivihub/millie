@@ -329,6 +329,58 @@ check('Gemini prompt preserves previous response and same-text consecutive turns
   assert.ok(prompt.systemInstruction.parts[0].text.includes('カメラ'));
   assert.ok(!JSON.stringify(prompt).includes('undefined'));
 });
+check('legacy text history reaches the Gemini prompt in user-model-current order', () => {
+  const legacy = [{ role: 'user', text: '前の質問。' }, { role: 'model', text: '前の返事。' }];
+  const user = Object.assign(fresh(), { history: JSON.stringify(legacy) });
+  const before = JSON.stringify(user);
+  const prompt = core.buildPrompt(user, '今回の質問。');
+  assert.deepEqual(json(prompt.contents.map(item => item.role)), ['user', 'model', 'user']);
+  assert.deepEqual(json(prompt.contents.map(item => item.parts[0].text)), ['前の質問。', '前の返事。', '今回の質問。']);
+  assert.equal(JSON.stringify(user), before);
+});
+check('mixed history prefers string content and falls back to legacy string text', () => {
+  const entries = [
+    { role: 'user', content: '新形式の質問。', text: '使わない旧質問。' },
+    { role: 'model', content: '新形式の返事。', text: '使わない旧返事。' },
+    { role: 'user', content: 7, text: '旧形式の次の質問。' },
+    { role: 'model', content: null, text: '旧形式の次の返事。' }
+  ];
+  const prompt = core.buildPrompt(Object.assign(fresh(), { history: entries }), '今回の質問。');
+  assert.deepEqual(json(prompt.contents.map(item => item.parts[0].text)), ['新形式の質問。', '新形式の返事。', '旧形式の次の質問。', '旧形式の次の返事。', '今回の質問。']);
+  assert.deepEqual(json(prompt.contents.map(item => item.role)), ['user', 'model', 'user', 'model', 'user']);
+});
+check('empty string content still takes precedence over legacy text', () => {
+  const user = Object.assign(fresh(), { history: JSON.stringify([
+    { role: 'user', content: '', text: '置き換えない旧文。' },
+    { role: 'model', text: '旧返事。' }
+  ]) });
+  const prompt = core.buildPrompt(user, '今回の質問。');
+  assert.equal(prompt.contents[0].parts[0].text, '');
+  assert.ok(!JSON.stringify(prompt).includes('置き換えない旧文。'));
+});
+check('legacy history drops null, unknown-role, and non-string records', () => {
+  const user = Object.assign(fresh(), { history: JSON.stringify([
+    null, {}, 3, { role: 'system', text: '無効な役割。' },
+    { role: 'user', content: null, text: 9 },
+    { role: 'user', text: '有効な質問。' },
+    { role: 'model', content: {}, text: '有効な返事。' }
+  ]) });
+  const prompt = core.buildPrompt(user, '今回の質問。');
+  assert.deepEqual(json(prompt.contents.map(item => item.parts[0].text)), ['有効な質問。', '有効な返事。', '今回の質問。']);
+});
+check('legacy history normalization keeps record, character, and UTF-8 limits without mutating input', () => {
+  const legacy = Array.from({ length: 30 }, (_, i) => ({ role: i % 2 ? 'model' : 'user', text: '履歴'.repeat(300) + i }));
+  const user = Object.assign(fresh(), { history: legacy });
+  const before = JSON.stringify(user);
+  const result = reply(user, '__follow__');
+  const normalized = JSON.parse(result.user.history);
+  assert.ok(normalized.length <= 12);
+  assert.ok(normalized.some(item => item.content.startsWith('履歴')));
+  assert.ok(normalized.every(item => typeof item.content === 'string' && item.content.length <= 500 && !Object.hasOwn(item, 'text')));
+  assert.ok(normalized.every(item => /^(user|assistant)$/.test(item.role)));
+  assert.ok(Buffer.byteLength(result.user.history, 'utf8') <= 2400);
+  assert.equal(JSON.stringify(user), before);
+});
 check('Gemini prompt omits imported sensitive profile cells', () => {
   const prompt = core.buildPrompt(Object.assign(fresh(), { location: 'IMPORTED_PRIVATE_LOCATION', secrets: 'IMPORTED_PRIVATE_SECRET', workplace: 'IMPORTED_WORK' }), 'こんにちは');
   for (const forbidden of ['IMPORTED_PRIVATE_LOCATION', 'IMPORTED_PRIVATE_SECRET', 'IMPORTED_WORK']) assert.ok(!JSON.stringify(prompt).includes(forbidden));

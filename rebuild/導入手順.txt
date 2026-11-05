@@ -1,101 +1,98 @@
-ミリーちゃん v10 検証・導入手順
+ミリーちゃん v10 導入手順
 
-このパッケージを現在のプロジェクトに追加するだけでは利用できません。
-既存のCode.gs/sheetInit.gsと新しいdoPostなどが衝突するため、新しい検証用Apps Scriptプロジェクトで確認します。
-既存コードのバックアップと、users/queue/logsを含むスプレッドシートのコピーを用意してから行います。
-現行への適用・デプロイはこの作業では実施していません。
+推奨はLegacyTransport版です。既存LINEのWebhook URLを維持し、GASのqueueからpush送信する接続を引き継ぎます。
+Gateway版は、Cloudflare側でLINE署名を検証する任意の別構成です。同じイベントを両方へ流す構成にはしません。
+本番反映の最終確認は「リリース記録.txt」を参照してください。配布ファイルの存在だけでは公開済みと判断できません。
 
-1. 手元で試す
-ミリーちゃん_作品準拠サンプル.htmlをブラウザで開く。
-固定分岐デモなので資格情報やネット接続は不要。名前・会話は外部送信や永続保存をしない。
-制作確認から段階を切り替え、怪談・結末・共有カードを確認する。
+1. ローカルで会話を確認する
+「ミリーちゃん_作品準拠サンプル.html」をブラウザで開きます。
+固定分岐デモなので資格情報やネット接続は不要です。名前・会話は外部送信や永続保存をしません。
+制作確認から段階、怪談、結末、共有カードを確認します。
 
-2. Apps Scriptの検証プロジェクト
-apps-script/Core.gs、Runtime.gs、AI.gs、Deployment.gsを新しいプロジェクトへ入れる。
-既存のCode.gs/sheetInit.gsは同じプロジェクトに混在させない。
-appsscript.jsonにAsia/TokyoとV8を指定する。
-Script Propertiesへ次を設定する。値をコードやGitに貼らない。
-  SPREADSHEET_ID：検証用スプレッドシートのID
-  CHANNEL_ACCESS_TOKEN：検証用LINE Messaging APIのアクセストークン
-  MILLIE_GATEWAY_SECRET：独自に生成した十分長いランダム値
-  LINE_ADD_URL：任意。未指定はユーザー指定の@575kepfk
-  MILLIE_AI_ENABLED：初期はfalse
-  GEMINI_API_KEY：AIを有効化する場合だけ設定
-  GEMINI_MODEL：利用アカウントで使えるモデルID。コード側で古いモデル名を固定しない。
-  MILLIE_AI_ENABLED=true：実モデルの検証時に有効化する。
+2. 既存環境を保全する
+既存GASのHEAD、現在LINEが参照する公開版、manifest、トリガー設定、Script Propertiesの設定項目を記録します。
+users・queue・logsを含むスプレッドシート全体を別ファイルへバックアップします。秘密値はコードやGit、公開記録へ貼りません。
+HEADと公開版は同じ内容とは限りません。新バージョンを作るときは、その時点のHEADが保存されます。
+検証はシートのコピーとテスト用LINEで先に行います。
+initSheets、setupTriggers、migrateToV9、clear、全ユーザーの初期化は実行しません。
 
-previewMigration()：ヘッダーの確認のみ。データは書き換えない。
-installMillieV10()：空の検証用ブックでusersがない場合に37項目のシートを作成する。既存usersはヘッダーの検証のみ。
-再送の重複排除用に専用タブmillie_event_dedupeを作成する。既存users/queue/logsの列・値は初期化しない。
-このタブにはイベントのハッシュキー・処理時刻・状態だけを記録し、名前や会話内容は保存しない。
-完了履歴は24時間有効。期限切れ行は受信時に最大毎時清掃する。検証中もdedupeタブの手動削除・改名はしない。
-不足・重複ヘッダーがあれば停止する。既存列の並び替え・削除・clear・旧migrateToV9実行はしない。
+3. 推奨：LegacyTransport版のコードと設定
+Core.gs、AI.gs、Deployment.gs、LegacyTransport.gs、Runtime.gsの内部処理を使います。
+既存Code.gs・sheetInit.gsなどの同名関数は混在させず、バックアップを残してコードを入れ替えます。
 
-Webアプリとしてデプロイするときは「次のユーザーとして実行：自分」「アクセスできるユーザー：全員」を指定する。
-Googleへのログインを要求する設定ではWorkerから呼び出せない。認証なしの別セッションでも /exec がログイン画面へ移動しないことを確認する。
-外部からの処理はMILLIE_GATEWAY_SECRETが一致した場合だけ受け付ける。Google Workspaceの組織設定で「全員」が選べない場合は、この構成のまま本番切替しない。
+重要：LegacyTransport版では、グローバルなdoPost・doGetをLegacyTransport.gsだけにします。
+Runtime.gs末尾から次の2行だけを外します。MillieRuntime本体、previewMigration、installMillieV10は残します。
+  function doPost(e) { return MillieRuntime.receive(e); }
+  function doGet(e) { return MillieRuntime.health(); }
+複数ファイルで同名入口を定義したまま、ファイル順序に依存させないでください。
 
-preflightMillieV10()：GASエディタから実行する接続確認。必要設定、シートのヘッダー、LINE bot情報の基本ID一致、Geminiのモデル情報を確認する。
-LINEへのメッセージ送信やusersの書換えはしない。秘密値やAPIエラー本文は出力しない。
-専用タブのヘッダーはinstallMillieV10()で検査されるため、先にinstallerを実行して正常終了を確認する。
-ready=trueでも実際の会話・返信トークン・モデルの回答品質は別途テストする。
+Webアプリは「次のユーザーとして実行：自分（USER_DEPLOYING）」「アクセスできるユーザー：全員」で既存と同じ所有者が実行します。
+Webhookと所有者の時間トリガーが同じUserLockを使うことが前提です。
+manifestはAsia/TokyoとV8を使用します。明示oauthScopesを使う場合は、spreadsheets、script.external_requestに加えて、トリガー操作用のscript.scriptappが必要です。
+既存プロジェクトの自動scope判定を維持する方法もあります。所有者の承認状態を確認します。
 
-3. 署名検証用の入口
-LINEの署名はHTTPヘッダーにあるがApps ScriptのdoPostイベントではそのヘッダーを取得できないため、gateway/worker.mjsを使う。
-別のCloudflare Workerとして作成する（既存サイトのWorkerは変更しない）。
-Worker Secrets:
-  LINE_CHANNEL_SECRET：検証用LINEチャネルのシークレット
-  MILLIE_GATEWAY_SECRET：Apps Scriptと同じ値
-  GAS_WEB_APP_URL：検証用Apps ScriptをWebアプリとしてデプロイした /exec URL
-WorkerはLINEの未加工本文をHMAC-SHA256検証後にGASへ渡す。署名がない／違う場合は処理しない。
-LINEのWebhook URLはWorkerの https://(作成したドメイン)/webhook とする。
-Script PropertiesとWorker Secretsには本番の値を使う前に検証環境で確認する。
-LINE管理画面の自動応答が二重返信にならないかも確認する。
-一時的な失敗時に再送できるよう、LINE DevelopersでWebhook再送を有効にして検証する。
-Reply Tokenが失効した場合、勝手にpushで補完しないため、その返信は配信できないことがある。
+Script Propertiesへ必要な設定を入れます。既存のトークンやシート参照は保ち、必要な項目を追加します。
+  SPREADSHEET_ID：接続するブック。検証ではコピーしたブックを指定。
+  CHANNEL_ACCESS_TOKEN：対象LINEアカウントの既存Messaging APIトークン。
+  MILLIE_GATEWAY_SECRET：Runtime内部処理にも必要な十分長いランダム値。
+  LINE_ADD_URL：任意。未指定はユーザー指定の@575kepfk。
+  MILLIE_AI_ENABLED：AIを使う本番構成ではtrue。
+  GEMINI_API_KEY：既存の利用可能なGeminiキー。
+  GEMINI_MODEL：利用権限と対応を確認したモデルID。
+  MILLIE_V10_READY：準備中はfalse。検証と公開確認後にtrue。
+MILLIE_GATEWAY_SECRETは、この直接GAS受信のLINE署名を検証するものではありません。
+2.5 Flash系ではAI.gsがthinkingBudget:0、includeThoughts:falseを指定します。他のモデルへ一律には追加しません。
 
-4. 検証項目
-新規follow、通常会話、コマンド、52通の進行、占い同日制限、停止・再開、怪談の解放、共有カード。
-同一webhookEventIdの再送、LINE API失敗後の再送、既存旧結末を持つユーザーの扱い。
-実ユーザー情報を使ったスクリーンショットは共有しない。テストアカウントで実施。
-Gemini有効化時は相談への自然な応答と物語を先取りしないことを確認する。
+4. スキーマと接続を確認する
+previewMigration()はusersのヘッダーを読み取り確認します。
+installMillieV10()は既存usersの必須37項目を検査し、重複排除用millie_event_dedupeを準備します。
+usersがない検証ブックでは新規シートを作成しますが、既存usersの行・追加列・既存queue/logsは初期化しません。
+不足・重複ヘッダーや不正な専用タブがあれば停止します。初期化関数で直そうとせず、コピー上で不足項目を確認します。
+preflightMillieV10()は必要設定、LINE基本ID、Geminiモデル情報、スキーマを確認します。
+最終の固定診断結果だけをログへ出し、秘密値・APIエラー本文・他アカウントのIDは出しません。LINE送信やusers更新は行いません。
+ready=trueは会話品質や実際の配信成功を保証しません。
 
-5. 本番切替
-検証通過後、元のスプレッドシート全体と現行スクリプト・デプロイ版・トリガー設定をバックアップする。
-検証済みプロジェクトとGatewayに本番の設定を入れ、対象ブックを確認する。
-LINE Developersでは基本ID @575kepfk の公式アカウントに接続するMessaging APIチャネルであることを確認する。
-現行Webhook URL、有効・再送の状態、GASのデプロイID・版、旧トリガーの関数名・実行間隔を切戻し記録へ残す。
-署名なしのWorker呼出しが拒否され、正しい署名の空イベントが成功することを確認する。この確認ではLINEへメッセージを送らない。
-空イベントの検証はWorkerで完了するため、GAS・シート・返信APIの疎通確認にはならない。これらは別途確認する。
-LINEのWebhookだけを新Gatewayへ切り替える。元のURLはロールバック用に記録する。
-旧プロジェクトのprocessQueue等のキュー処理と自動配信トリガーは切替後も動くため、実際の設定と未処理queueを確認し、切替時の扱いを記録して停止する。
-Webhookの切替だけでは旧トリガーも既存queueも停止・移行しない。新プロジェクトへ旧トリガーをコピーしない。
-切替後はテストアカウントで会話・停止・再開を確認する。問題があればWebhookを旧URLへ戻し、記録した旧トリガーを復元する。
-Webhookを戻しても新版が更新したusersの値は戻らない。必要なデータ復旧はバックアップと変更対象を確認して個別に行い、スプレッドシートの初期化で戻そうとしない。
+LegacyTransportのqueueは先頭4列timestamp/userId/text/statusを維持し、末尾にイベントID・種別・試行回数・最終試行時刻を追加します。
+既存行や追加列を削除しません。queueのプレビュー処理も不足メタデータ列を補完するため、完全な読取専用とは扱いません。
+切替前にpending/processingの件数と日時を確認し、旧処理の再送方針を記録します。
+イベントIDのない古いpendingは、導入記録時刻より10分を超えて前、または日時不明の場合にlegacy_pendingへ分け、自動送信しません。
+直近の行やprocessingは処理対象になり得ます。旧キュー全体が自動で無効になるとは考えないでください。
 
-テストコマンド（Node.js 22以上、rebuildフォルダで実行）
-node verify.cjs
+5. 既存LINE接続を維持して公開する
+MILLIE_V10_READY=falseで準備し、データとキューの確認を終えてから、現在LINEが使う既存GASデプロイを新バージョンへ更新します。
+新しい別URLをLINEへ登録する方法ではなく、既存デプロイを更新してWebhook URLを維持します。
+公開版とHEADの両方が想定のv10構成であることを確認し、MILLIE_V10_READY=trueにします。
+?health=1は固定のv10/legacy-queue情報を返します。健康確認だけではキュー・Gemini・LINE送信の検証にはなりません。
 
-個別実行
-node apps-script/core.test.cjs
-node tests/runtime.test.cjs
-node tests/integration.test.cjs
-node apps-script/ai.test.cjs
-node tests/output-guard.test.cjs
-node tests/deployment.test.cjs
-node gateway/worker.test.mjs
+processQueueは未処理行を取り出し、Runtime内部のpush経路を使います。Runtimeの公開Gateway入口では、JSONフラグだけでpush送信モードを選べません。LegacyTransportは別のGAS内部入口を使います。
+単発トリガーは専用IDで管理します。保険として所有者が5分ごとのprocessQueueを設ける場合も、その作成IDだけを記録・管理します。
+既存トリガーをまとめて削除するsetupTriggersは使いません。旧midnightBroadcast/horrorBroadcastは、この構成では無送信の互換関数です。
+旧定期トリガーや外部処理の残りも確認し、リリース記録へ扱いを残します。
 
-ブラウザテストは別途PlaywrightとChromiumを用意し、node tests/ui-smoke.cjs。
-デモHTMLは生成済みなので、ZIPを開くだけならビルドは不要。
+テスト用アカウントで通常会話、怪談、占い、停止・再開、共有カード、失敗後の再送を確認します。一括配信は行いません。
+戻す場合はREADYをfalseにし、記録した公開版とHEADの両方を復元します。公開版だけ戻しても時間トリガーのコードは戻りません。
+コードを戻しても更新済みusersの値は戻りません。必要なデータ復旧はバックアップと変更対象を確認して個別に行い、シートの初期化で戻そうとしないでください。
 
-現行版の内部説明文の誤送信対策だけを先に行う場合は、hotfix/適用手順.txtを確認する。
-これは現行ソースと呼出し元を照合してから適用する最小パッチ候補であり、パッケージ生成時点では未適用。
-TinyFishを使わない手元での貼り替えには、hotfix/無料で反映する手順.txtとhotfix/legacy-inline-patch.txtを使う。
-既存callGeminiの2行に一致する場合だけ貼り替え、既存Webアプリを新バージョンへ更新する。
+6. 任意：Gateway版
+この構成ではLegacyTransport.gsを組み込まず、Runtime.gsのdoPost/doGetをそのまま使います。
+LINEのWebhookを別のCloudflare Workerの /webhook へ向け、WorkerからGASへ共有secret付きで渡します。
+Worker SecretsはLINE_CHANNEL_SECRET、MILLIE_GATEWAY_SECRET、GAS_WEB_APP_URLです。secretを公開コードへ入れません。
+Workerは未加工本文のHMAC-SHA256署名を確認します。GASの直接doPostで署名ヘッダーを取得したと説明しないでください。
+署名がない・一致しない呼出しを拒否し、正しい署名の空イベントを受けることを確認します。
+空イベント検証はWorkerで完了するため、GAS・シート・LINE返信APIの疎通確認にはなりません。
+この経路はreply APIを使用します。Reply Token失効時にpushへ勝手に切り替えません。
+切替時は既存LegacyTransportキュー・旧処理・Webhookの戻し先を記録し、二重処理を避けます。
 
-制限
-本番コードの全量取得ができていないため、現在の全機能を自動で置き換える移行ツールは付けていない。
-自動配信・記念日通知・実紹介の計測は今回未接続。
-LINE/Geminiの実通信、Cloudflare/GASの実デプロイ、実機の共有はこのパッケージ生成時には行っていない。
-完了履歴2000件で停止する制限は専用タブへの保存で解消したが、未送信のprepared/pendingは1件8KB、Properties全体400KiB、件数2000件まで。
-GASのProperties・UrlFetchの日次クォータ、6分の実行時間、5秒のロック待ち、Sheetsの総セル数制限は残る。大量の同時アクセスを無制限に処理できる構成ではない。
+7. 自動検証と制限
+Node.js 22以上、rebuildフォルダで実行：
+  node verify.cjs
+個別のLegacyTransport検証：
+  node tests/legacy-transport.test.cjs
+ブラウザ操作検証は別途PlaywrightとChromiumを用意し、node tests/ui-smoke.cjsを実行します。
+デモHTMLは生成済みなので、開くだけならビルド不要です。
+
+LegacyTransportのGAS直接受信にはLINE署名検証を追加していません。
+pushの送信枠・課金はLINE公式アカウントの契約に従います。GASとGeminiにも利用枠・実行時間の上限があります。
+自動深夜配信・記念日配信・実紹介人数の新しい計測は今回の会話エンジンへ接続していません。
+実顧客でのv10送受信・匿名カードの実転送、実SNS投稿、拡散効果、大規模負荷の検証は現時点で未実施です。以後の確認結果はリリース記録を参照します。
+旧版向けhotfix資料は参考用です。既に反映された対策の上へ、古い2行置換を重ねて適用しないでください。

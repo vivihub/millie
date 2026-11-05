@@ -209,9 +209,11 @@ var MillieCore = (function () {
   }
   function history(value) {
     var items = array(value).filter(function (item) {
-      return item && /^(user|assistant|model)$/.test(item.role) && typeof item.content === 'string';
+      return item && /^(user|assistant|model)$/.test(item.role) && (typeof item.content === 'string' || typeof item.text === 'string');
     }).map(function (item) {
-      return { role: item.role === 'model' ? 'assistant' : item.role, content: item.content.slice(0, 500) };
+      // Legacy GAS rows use text; modern content wins even when it is empty.
+      var content = typeof item.content === 'string' ? item.content : item.text;
+      return { role: item.role === 'model' ? 'assistant' : item.role, content: content.slice(0, 500) };
     }).slice(-12);
     // Leave room for other persisted fields in the GAS outbox property (8 KB).
     // Count actual UTF-8 bytes, including JSON punctuation, not JS code units.

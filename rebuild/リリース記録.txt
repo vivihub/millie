@@ -1,0 +1,38 @@
+ミリーちゃん 公開用リリース記録
+
+実デプロイID、Webhookの管理用URL、トークン、秘密値、個人の会話はこの記録へ含めません。
+
+2026年11月5日：旧版の内部説明文の誤送信対策
+既存GASの出力抽出・最終送信・履歴への対策と、Gemini 2.5 Flashのthinking設定を含む緊急対策について、本番反映の確認を完了。
+既存LINEの接続を維持し、全ユーザーの履歴やusersを一括初期化する処理は行っていません。
+
+2026年11月5日：v10会話・匿名共有カードの本番反映確認
+構成：LegacyTransport。既存GASのWebhook URL、queue、pushの接続を継続。
+既存の本番デプロイを更新し、公開版とHEAD、設定、ソースの読み戻しを確認。
+MILLIE_V10_READY=true。公開URLの?health=1はHTTP 200、storyVersion=v10、transport=legacy-queue。
+空イベントのPOSTはHTTP 200、ok=true、queued=0。一般ユーザーへのメッセージ送信ではありません。
+
+データと処理
+既存LINEアカウント・Webhook設定の一致、usersの保持・必須37項目、未処理キューの状態を確認。
+installは既存usersを初期化せず、必要な専用タブを準備。
+所有者の5分ごとのprocessQueue監視トリガーを設定。旧broadcastの互換関数は無送信。
+既存プロフィール・紹介実績・追加列を全ユーザー分リセットする処理は行っていません。
+
+生成・メッセージ形式の確認
+Gemini 2.5 FlashのthinkingBudget:0/includeThoughts:falseで、合成のあいさつに対する自然な短文とAI生成採用を確認。
+LINEメッセージ検証APIで、通常textと匿名共有用Flexの両形式がHTTP 200。
+検証APIは実送信ではありません。顧客への一括配信も行っていません。
+最終自動検証：Core 74、Runtime 40、結合5、AI 16、旧版guard 7、Deployment 10、LegacyTransport 14の計166項目が成功。
+Gatewayの署名・改ざん・サイズ・入口検証も成功。Chromiumでの操作確認は34項目が成功。
+実行コマンド：rebuildフォルダでnode verify.cjs。ブラウザ操作確認はnode tests/ui-smoke.cjs。
+診断用の一時デプロイは削除完了。今回対象外の既存デプロイは変更せず維持。
+
+確認していない範囲
+実顧客によるv10のLINE往復、匿名カードの実転送、実SNSへの投稿、拡散成果、大規模負荷。
+固定health、空イベント、合成Gemini応答、メッセージ形式の検証を、実顧客テストや投稿成功と同一視しません。
+SNSで話題になることや、友だち追加・再生数の増加は保証しません。
+
+接続の境界と戻し方
+従来GAS直接受信にLINE署名検証を追加したとは扱いません。署名検証用Gatewayは任意の別構成です。
+問題時はREADYをfalseにし、非公開のバックアップ記録に従って公開版とHEADの両方を戻します。
+コードの戻しで更新済みの会話進行が自動的に戻るわけではありません。シートを初期化せず、必要な変更だけを確認して復旧します。

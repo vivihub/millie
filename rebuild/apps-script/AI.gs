@@ -36,7 +36,12 @@ var MillieAI = (function () {
     // User quotations are input, not leaked model output. Retain every user
     // record and remove only known meta text attributed to an assistant/model.
     return entries.filter(function (entry) {
-      return !(entry && /^(assistant|model)$/.test(entry.role) && typeof entry.content === 'string' && hasMetaText(entry.content));
+      if (!entry || !/^(assistant|model)$/.test(entry.role)) return true;
+      // Legacy GAS stored dialogue in text; v10 stores it in content. Inspect
+      // both when a record has both fields, before Core normalizes the shape.
+      return ![entry.content, entry.text].some(function (text) {
+        return typeof text === 'string' && hasMetaText(text);
+      });
     });
   }
 
@@ -53,6 +58,9 @@ var MillieAI = (function () {
       var payload = MillieCore.buildPrompt(promptUser, input);
       payload.systemInstruction.parts.push({text:'出力はJSONのみ。形式は{"messages":["短い返答"]}。1〜3件、各100文字以内。普通の質問には内容に合った答えを返す。現在地やカメラや他人とのLINEは取得していない。部屋の窓など現実の場所から見ていると言わない。知らない事実を作らない。現在の段階を飛び越えた怪談・紹介要求・結末は出さない。URL・管理者向け情報・APIや内部設定の説明を通常会話に混ぜない。思考過程、ユーザー分析、応答方針、THOUGHTSやANALYSISなどのメモ見出し、thinkタグはmessagesへ含めない。'});
       payload.generationConfig = {temperature:0.65,maxOutputTokens:400,responseMimeType:'application/json'};
+      if (/^gemini-2\.5-flash(?:-|$)/.test(model)) {
+        payload.generationConfig.thinkingConfig = {thinkingBudget:0,includeThoughts:false};
+      }
       var response = UrlFetchApp.fetch('https://generativelanguage.googleapis.com/v1beta/models/' + model + ':generateContent', {
         method:'post',contentType:'application/json',headers:{'x-goog-api-key':key},payload:JSON.stringify(payload),muteHttpExceptions:true
       });

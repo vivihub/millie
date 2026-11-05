@@ -30,6 +30,8 @@ var MillieRuntime = (function () {
   var MAX_BODY_BYTES = 1024 * 1024;
   var MAX_BATCH_EVENTS = 100;
   var DEFAULT_ADD_URL = 'https://line.me/R/ti/p/@575kepfk';
+  // This capability stays inside the closure and cannot be supplied by JSON.
+  var PUSH_DELIVERY = {};
 
   function fault(code) {
     var error = new Error(code);
@@ -425,16 +427,25 @@ var MillieRuntime = (function () {
     return messages;
   }
 
-  function reply(properties, token, messages) {
+  function validPushRetryKey(value) {
+    return typeof value === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+  }
+
+  function reply(properties, token, messages, deliveryMode, userId, pushRetryKey) {
     if (!messages.length) return { success: true };
-    if (typeof token !== 'string' || !token) return { success: false, code: 'reply_token_missing', retryable: false };
+    var isPush = deliveryMode === 'push';
+    if (isPush && (typeof userId !== 'string' || !userId)) return { success: false, code: 'push_target_missing', retryable: false };
+    if (isPush && !validPushRetryKey(pushRetryKey)) return { success: false, code: 'invalid_push_retry_key', retryable: false };
+    if (!isPush && (typeof token !== 'string' || !token)) return { success: false, code: 'reply_token_missing', retryable: false };
     var accessToken = requireProperty(properties, 'CHANNEL_ACCESS_TOKEN');
+    var headers = { Authorization: 'Bearer ' + accessToken };
+    if (isPush) headers['X-Line-Retry-Key'] = pushRetryKey;
     var response;
     try {
-      response = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/reply', {
+      response = UrlFetchApp.fetch('https://api.line.me/v2/bot/message/' + (isPush ? 'push' : 'reply'), {
         method: 'post', contentType: 'application/json',
-        headers: { Authorization: 'Bearer ' + accessToken },
-        payload: JSON.stringify({ replyToken: token, messages: messages }),
+        headers: headers,
+        payload: JSON.stringify(isPush ? { to: userId, messages: messages } : { replyToken: token, messages: messages }),
         muteHttpExceptions: true
       });
     } catch (_) {
@@ -442,9 +453,22 @@ var MillieRuntime = (function () {
     }
     var status = response.getResponseCode();
     if (status >= 200 && status < 300) return { success: true };
+    if (isPush && status === 409) {
+      // LINE reports an already-accepted retry key using this response header.
+      // Do not treat an unrelated conflict or an empty header as acceptance.
+      try {
+        var responseHeaders = response.getAllHeaders();
+        var accepted = Object.keys(responseHeaders).some(function (name) {
+          if (name.toLowerCase() !== 'x-line-accepted-request-id') return false;
+          var values = Array.isArray(responseHeaders[name]) ? responseHeaders[name] : [responseHeaders[name]];
+          return values.some(function (value) { return typeof value === 'string' && value.trim().length > 0; });
+        });
+        if (accepted) return { success: true };
+      } catch (_) {}
+    }
     // Do not log the response body: LINE may include request details.
-    // 400 can mean an already-used / expired token. Keep pending for a redelivery
-    // with a usable token; never resend this event through the push API.
+    // A public Reply failure remains Reply-only. Only the separate server-side
+    // entry point may create Push outboxes; no token failure upgrades delivery.
     return { success: false, code: 'line_http_' + status, retryable: status === 400 || status === 429 || status >= 500 };
   }
 
@@ -489,7 +513,7 @@ var MillieRuntime = (function () {
       typeof event.message.text === 'string' && event.message.text.length > 0 && event.message.text.length <= 5000;
   }
 
-  function handleEvent(store, completions, properties, event, now) {
+  function handleEvent(store, completions, properties, event, now, deliveryMode) {
     if (!supported(event)) return { status: 'skipped' };
     if (typeof event.webhookEventId !== 'string' || !event.webhookEventId || event.webhookEventId.length > 256) {
       throw fault('webhook_event_id_required');
@@ -504,6 +528,7 @@ var MillieRuntime = (function () {
     if (record && (record.status === 'done' || record.status === 'abandoned')) return { status: 'duplicate' };
     var userId = event.source.userId;
     if (record && record.userHash !== hash(userId)) throw fault('event_source_mismatch');
+    if (record && (record.deliveryMode || 'reply') !== deliveryMode) throw fault('event_delivery_mode_mismatch');
     // Complete this user's interrupted sheet commit before computing a later
     // event. Otherwise an old prepared patch could roll back newer progress.
     recoverPrepared(store, properties, userId);
@@ -518,10 +543,14 @@ var MillieRuntime = (function () {
       // An unknown unfollow is recorded without creating a user row.
       if (event.type === 'unfollow' && !found.user) patch = {};
       record = {
-        v: 1, created: now.getTime(), status: 'prepared', userHash: hash(userId),
+        v: 1, created: now.getTime(), status: 'prepared', userHash: hash(userId), deliveryMode: deliveryMode,
         patch: patch, messages: lineMessages(computed.result, properties),
         activeReply: computed.result.user.is_active !== false
       };
+      if (deliveryMode === 'push') {
+        record.pushRetryKey = Utilities.getUuid();
+        if (!validPushRetryKey(record.pushRetryKey)) throw fault('invalid_push_retry_key');
+      }
       // Journal first. A crash before/after sheet writes replays the same patch,
       // never reruns the narrative engine or adds to message_count again.
       saveRecord(properties, key, record);
@@ -533,19 +562,20 @@ var MillieRuntime = (function () {
     if (completed(completions, key, now.getTime())) return { status: 'duplicate' };
     record = loadRecord(properties, key);
     if (record.status === 'abandoned') return { status: 'duplicate' };
-    var outcome = reply(properties, event.replyToken, record.messages);
+    var outcome = reply(properties, event.replyToken, record.messages, deliveryMode, userId, record.pushRetryKey);
     if (outcome.success) {
       markDone(completions, properties, key, record);
       return { status: 'done' };
     }
     // Retain the fixed outbox on LINE errors. No additional history/count update.
-    // The gateway returns non-2xx so LINE redelivery can supply another token.
+    // The caller retries the same immutable outbox without rerunning Core.
     return { status: 'pending', error: outcome.code };
   }
 
-  function receive(e) {
+  function receive(e, deliveryCapability) {
     var lock = null;
     try {
+      var deliveryMode = deliveryCapability === PUSH_DELIVERY ? 'push' : 'reply';
       var raw = e && e.postData && e.postData.contents;
       if (typeof raw !== 'string' || bytes(raw) > MAX_BODY_BYTES) return json({ ok: false, error: 'invalid_envelope' });
       var payload;
@@ -571,7 +601,7 @@ var MillieRuntime = (function () {
       var pending = false;
       var errors = [];
       payload.events.forEach(function (event) {
-        var result = handleEvent(store, completions, properties, event, now);
+        var result = handleEvent(store, completions, properties, event, now, deliveryMode);
         if (result.status === 'skipped') skipped += 1;
         else processed += 1;
         if (result.status === 'pending') {
@@ -585,6 +615,17 @@ var MillieRuntime = (function () {
       return json({ ok: false, error: error && error.code ? error.code : 'runtime_error' });
     } finally {
       if (lock && lock.hasLock()) lock.releaseLock();
+    }
+  }
+
+  function receivePushEvents(events) {
+    // Server-only bridge for the existing GAS queue transport. There is no
+    // top-level function or HTTP payload flag that can select this mode.
+    try {
+      var secret = requireProperty(PropertiesService.getScriptProperties(), 'MILLIE_GATEWAY_SECRET');
+      return receive({ postData: { contents: JSON.stringify({ gatewaySecret: secret, events: events }) } }, PUSH_DELIVERY);
+    } catch (error) {
+      return json({ ok: false, error: error && error.code ? error.code : 'runtime_error' });
     }
   }
 
@@ -630,7 +671,8 @@ var MillieRuntime = (function () {
   }
 
   return {
-    receive: receive,
+    receive: function (e) { return receive(e); },
+    receivePushEvents: receivePushEvents,
     preview: preview,
     install: install,
     health: function () { return json({ ok: true, service: 'millie-runtime', version: '1.0', gatewayRequired: true }); }
